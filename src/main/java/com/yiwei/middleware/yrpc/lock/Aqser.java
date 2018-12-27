@@ -110,6 +110,21 @@ public abstract class Aqser implements java.io.Serializable {
     }
 
     /**
+     * CAS 的方式，设置Aqser同步器的state
+     * @param expect
+     * @param update
+     * @return
+     */
+    protected final boolean compareAndSetState(int expect, int update) {
+        return unsafe.compareAndSwapInt(this, stateOffset, expect, update);
+    }
+
+    /**
+     * 采用自旋来取代线程切换，提高相应速度，默认自旋时间1000纳秒
+     */
+    static final long spinForTimeoutThreshold = 1000L;
+
+    /**
      * unsafe包含了大量底层操作实现，使得java可以直接操作内存
      */
     private static final Unsafe unsafe = Unsafe.getUnsafe();
@@ -118,6 +133,7 @@ public abstract class Aqser implements java.io.Serializable {
     private static final long tailOffset;
     private static final long waitStatusOffset;
     private static final long nextOffset;
+
     static {
         try {
             stateOffset = unsafe.objectFieldOffset(Aqser.class.getDeclaredField("state"));
@@ -144,5 +160,26 @@ public abstract class Aqser implements java.io.Serializable {
          * var4 更新值
          */
         return unsafe.compareAndSwapObject(this, headOffset, null, update);
+    }
+
+    /**
+     * CAS 的方式，设置双向链表的tail
+     */
+    private final boolean compareAndSetTail(Node expect, Node update) {
+        return unsafe.compareAndSwapObject(this, tailOffset, expect, update);
+    }
+
+    /**
+     * CAS 的方式，设置Node对象中的线程状态
+     */
+    private static final boolean compareAndSetWaitStatus(Node node, int expect, int update) {
+        return unsafe.compareAndSwapInt(node, waitStatusOffset, expect, update);
+    }
+
+    /**
+     * CAS 的方式，设置Node对象中的next对象
+     */
+    private static final boolean compareAndSetNext(Node node, Node expect, Node update) {
+        return unsafe.compareAndSwapObject(node, nextOffset, expect, update);
     }
 }
