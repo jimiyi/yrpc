@@ -1,5 +1,7 @@
 package com.yiwei.middleware.yrpc.lock;
 
+import sun.misc.Unsafe;
+
 public abstract class Aqser implements java.io.Serializable {
     private static final long serialVersionUID = 1281595678908459731L;
 
@@ -57,6 +59,7 @@ public abstract class Aqser implements java.io.Serializable {
 
         /**
          * 判断是否在共享模式下
+         *
          * @return
          */
         final boolean isShared() {
@@ -65,6 +68,7 @@ public abstract class Aqser implements java.io.Serializable {
 
         /**
          * 返回前一个节点，如果为空则抛出NullPointerException
+         *
          * @return
          * @throws NullPointerException
          */
@@ -88,5 +92,57 @@ public abstract class Aqser implements java.io.Serializable {
             this.waitStatus = waitStatus;
             this.thread = thread;
         }
+    }
+
+    private transient volatile Node head;
+    private transient volatile Node tail;
+    /**
+     * 同步的状态
+     */
+    private volatile int state;
+
+    protected final int getState() {
+        return state;
+    }
+
+    protected final void setState(int newState) {
+        state = newState;
+    }
+
+    /**
+     * unsafe包含了大量底层操作实现，使得java可以直接操作内存
+     */
+    private static final Unsafe unsafe = Unsafe.getUnsafe();
+    private static final long stateOffset;
+    private static final long headOffset;
+    private static final long tailOffset;
+    private static final long waitStatusOffset;
+    private static final long nextOffset;
+    static {
+        try {
+            stateOffset = unsafe.objectFieldOffset(Aqser.class.getDeclaredField("state"));
+            headOffset = unsafe.objectFieldOffset(Aqser.class.getDeclaredField("head"));
+            tailOffset = unsafe.objectFieldOffset(Aqser.class.getDeclaredField("tail"));
+            waitStatusOffset = unsafe.objectFieldOffset(Node.class.getDeclaredField("waitStatus"));
+            nextOffset = unsafe.objectFieldOffset(Node.class.getDeclaredField("next"));
+        } catch (NoSuchFieldException e) {
+            //Error：表示由 JVM 所侦测到的无法预期的错误，由于这是属于 JVM 层次的严重错误，
+            // 导致 JVM 无法继续执行，因此，这是不可捕捉到的，无法采取任何恢复的操作，顶多只能显示错误信息。
+            throw new Error(e);
+        }
+    }
+
+    /**
+     * CAS 的方式，设置双向链表的head
+     */
+    private final boolean compareAndSetHead(Node update) {
+        /**
+         * compareAndSwapObject(Object var1, long var2, Object var3, Object var4)
+         * var1 操作的对象
+         * var2 操作的对象属性
+         * var3 var2与var3比较，相等才更新
+         * var4 更新值
+         */
+        return unsafe.compareAndSwapObject(this, headOffset, null, update);
     }
 }
