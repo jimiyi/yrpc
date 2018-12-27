@@ -2,6 +2,8 @@ package com.yiwei.middleware.yrpc.lock;
 
 import sun.misc.Unsafe;
 
+import java.util.concurrent.locks.LockSupport;
+
 public abstract class Aqser implements java.io.Serializable {
     private static final long serialVersionUID = 1281595678908459731L;
 
@@ -55,6 +57,9 @@ public abstract class Aqser implements java.io.Serializable {
          */
         volatile Thread thread;
 
+        /**
+         * 表示后续的节点是什么类型的节点，独占或者共享
+         */
         Node nextWaiter;
 
         /**
@@ -74,10 +79,11 @@ public abstract class Aqser implements java.io.Serializable {
          */
         final Node predecessor() throws NullPointerException {
             Node p = prev;
-            if (p == null)
+            if (p == null) {
                 throw new NullPointerException();
-            else
+            } else {
                 return p;
+            }
         }
 
         Node() {    // Used to establish initial head or SHARED marker
@@ -111,6 +117,7 @@ public abstract class Aqser implements java.io.Serializable {
 
     /**
      * CAS 的方式，设置Aqser同步器的state
+     *
      * @param expect
      * @param update
      * @return
@@ -181,5 +188,337 @@ public abstract class Aqser implements java.io.Serializable {
      */
     private static final boolean compareAndSetNext(Node node, Node expect, Node update) {
         return unsafe.compareAndSwapObject(node, nextOffset, expect, update);
+    }
+
+    //====================================链表操作========================================
+
+    /**
+     * 添加节点
+     *
+     * @param node
+     * @return 返回之前的尾节点
+     */
+    private Node enq(final Node node) {
+        for (; ; ) {
+            //取到尾节点，注意这里是多线程环境，可能重复多次才能取到，所以上面加上了无限循环
+            Node t = tail;
+            //先查看尾节点，如果尾节点为空，则表示整个链表不存在，需要初始化
+            if (t == null) {
+                if (compareAndSetHead(new Node())) {
+                    tail = head;
+                }
+            } else {
+                node.prev = t;
+                //设置尾节点，因为是多线程环境下，需要使用cas
+                if (compareAndSetTail(t, node)) {
+                    t.next = node;
+                    return t;
+                }
+            }
+        }
+    }
+
+    /**
+     * 根据模式创建锁等待者，锁上分为独占(Node.EXCLUSIVE)和共享(Node.SHARED)两种模式
+     *
+     * @param mode
+     * @return
+     */
+    private Node addWaiter(Node mode) {
+        Node node = new Node(Thread.currentThread(), mode);
+        Node pred = tail;
+        //如果列表尾部不为空，则将节点加入尾部,直接返回
+        if (pred != null) {
+            if (compareAndSetTail(pred, node)) {
+                pred.next = node;
+                return node;
+            }
+        }
+        //如果列表尾部为空，则构造链表
+        enq(mode);
+        return node;
+    }
+
+    /**
+     * Sets head of queue to be node, thus dequeuing. Called only by
+     * acquire methods.  Also nulls out unused fields for sake of GC
+     * and to suppress unnecessary signals and traversals.
+     *
+     * @param node the node
+     */
+    private void setHead(Node node) {
+        head = node;
+        node.thread = null;
+        node.prev = null;
+    }
+
+    /**
+     * 唤醒后续节点
+     *
+     * @param node
+     */
+    private void unparkSuccessor(Node node) {
+        int ws = node.waitStatus;
+        if (ws < 0) {
+            compareAndSetWaitStatus(node, ws, 0);
+        }
+        Node s = node.next;
+        //如果后续的节点是null，或者状态值是CANCELLED(取消状态，值为1，其他状态都是小于0的)
+        if (s == null || s.waitStatus > 0) {
+            s = null;
+            //从尾节点开始，遍历后续节点，直到找到状态值为非取消状态的
+            for (Node t = tail; t != null && t != node; t = t.prev) {
+                if (t.waitStatus <= 0) {
+                    s = t;
+                }
+
+            }
+        }
+        if (s != null) {
+            //唤醒线程
+            LockSupport.unpark(s.thread);
+        }
+    }
+
+    /**
+     * 共享锁释放，激活后续节点，并且标识成传播
+     */
+    private void doReleaseShared() {
+        for (; ; ) {
+            //从头节点开始释放
+            Node h = head;
+            if (h != null && h != tail) {
+                int ws = h.waitStatus;
+                //SIGNAL表示需要激活后续节点
+                if (ws == Node.SIGNAL) {
+                    if (!compareAndSetWaitStatus(h, Node.SIGNAL, 0)) {
+                        continue;            // loop to recheck cases
+                    }
+                    unparkSuccessor(h);
+                } else if (ws == 0 &&
+                        !compareAndSetWaitStatus(h, 0, Node.PROPAGATE)) {
+                    continue;                // loop on failed CAS
+                }
+
+            }
+            //如果循环中间head变了，则重复循环
+            if (h == head) {
+                break;
+            }
+        }
+    }
+
+    /**
+     * 设置头节点，？？
+     *
+     * @param node
+     * @param propagate
+     */
+    private void setHeadAndPropagate(Node node, int propagate) {
+        //记录旧的head节点，以便后续检查
+        Node h = head;
+        setHead(node);
+        if (propagate > 0 || h == null || h.waitStatus < 0 ||
+                (h = head) == null || h.waitStatus < 0) {
+            Node s = node.next;
+            if (s == null || s.isShared()) {
+                doReleaseShared();
+            }
+        }
+    }
+
+    //==================锁的获取和释放====================================
+
+    /**
+     * 取消正在获取锁的操作
+     * @param node
+     */
+    private void cancelAcquire(Node node) {
+        if (node == null) {
+            return;
+        }
+        node.thread = null;
+        //获取节点的前序节点
+        Node pred = node.prev;
+        //遍历前序节点，跳过状态是已取消的前序节点
+        while (pred.waitStatus > 0) {
+            node.prev = pred = pred.prev;
+        }
+        //获取到最先一个状态不为取消的前序节点的后续节点
+        Node predNext = pred.next;
+
+        //此节点状态设置成取消
+        node.waitStatus = Node.CANCELLED;
+
+        //如果这个节点是尾节点，则把尾节点设置成它的前序节点
+        if (node == tail && compareAndSetTail(node, pred)) {
+            //将最先一个状态不为取消的前序节点的next设置成null
+            compareAndSetNext(pred, predNext, null);
+        } else {
+            int ws;
+            if (pred != head &&
+                    //由于当前节点取消获取锁，所以pred的后续节点应该被唤醒，所以要设置pred的状态为SIGNAL
+                    ((ws = pred.waitStatus) == Node.SIGNAL || (ws <= 0 && compareAndSetWaitStatus(pred, ws, Node.SIGNAL)))
+                    && pred.thread != null) {
+                Node next = node.next;
+                //入参node不为null，且它的next节点的状态不是CANCELLED
+                if (next != null && next.waitStatus <= 0) {
+                    //将pred的next设置成入参node的next，相当于跳过了入参node这个节点
+                    compareAndSetNext(pred, predNext, next);
+                }
+            } else {
+                unparkSuccessor(node);
+            }
+            //help gc？？ 设置node的thread是null，next指向自身
+            node.next = node;
+        }
+    }
+
+    /**
+     * Checks and updates status for a node that failed to acquire.
+     * Returns true if thread should block. This is the main signal
+     * control in all acquire loops.  Requires that pred == node.prev.
+     *
+     * @param pred
+     * @param node
+     * @return
+     */
+    private static boolean shouldParkAfterFailedAcquire(Node pred, Node node) {
+        int ws = pred.waitStatus;
+        //首先检查前趋结点的waitStatus位，如果为SIGNAL
+        //表示前趋结点会通知它，那么它可以放心大胆地挂起了
+        if (ws == Node.SIGNAL) {
+            return true;
+        }
+        //如果前驱节点是取消的节点，则跳过
+        if (ws > 0) {
+            //跳过所有的取消节点
+            do {
+                node.prev = pred = pred.prev;
+            } while (pred.waitStatus > 0);
+            pred.next = node;
+        } else {
+            compareAndSetWaitStatus(pred, ws, Node.SIGNAL);
+        }
+        return false;
+    }
+
+    static void selfInterrupt() {
+        Thread.currentThread().interrupt();
+    }
+
+    /**
+     * park()会让当前线程进入waiting状态。在此状态下，
+     * 有两种途径可以唤醒该线程：1）被unpark()；2）被interrupt()
+     *
+     * @return
+     */
+    private final boolean parkAndCheckInterrupt() {
+        LockSupport.park(this);
+        return Thread.interrupted();
+    }
+
+    /**
+     * 使线程在等待队列中获取资源，一直获取到资源后才返回。
+     * 如果在整个等待过程中被中断过，则返回true，否则返回false。
+     *
+     * @param node
+     * @param arg
+     * @return
+     */
+    final boolean acquireQueued(final Node node, int arg) {
+        boolean failed = true;
+        try {
+            boolean interrupted = false;
+            //自旋
+            for (; ; ) {
+                final Node p = node.predecessor();
+                //head下的第一个节点有资格获取资源
+                if (p == head && tryAcquire(arg)) {
+                    //head永远指向获取资源的节点
+                    setHead(node);
+                    // setHead中node.prev已置为null，此处再将head.next置为null，
+                    // 就是为了方便GC回收以前的head结点。也就意味着之前拿完资源的结点出队了！
+                    p.next = null;
+                    failed = false;
+                    return interrupted;
+                }
+                if (shouldParkAfterFailedAcquire(p, node) && parkAndCheckInterrupt()) {
+                    interrupted = true;
+                }
+            }
+        } finally {
+            if (failed) {
+                cancelAcquire(node);
+            }
+        }
+    }
+
+    /**
+     * 获取独占锁，如果被中断则抛异常
+     *
+     * @param arg
+     * @throws InterruptedException
+     */
+    private void doAcquireInterruptibly(int arg) throws InterruptedException {
+        final Node node = addWaiter(Node.EXCLUSIVE);
+        boolean failed = true;
+        try {
+            for (; ; ) {
+                final Node p = node.predecessor();
+                if (p == head && tryAcquire(arg)) {
+                    setHead(node);
+                    p.next = null;
+                    failed = false;
+                    return;
+                }
+                if (shouldParkAfterFailedAcquire(p, node) && parkAndCheckInterrupt()) {
+                    throw new InterruptedException();
+                }
+            }
+        } finally {
+            if (failed) {
+                cancelAcquire(node);
+            }
+
+        }
+    }
+
+    private boolean doAcquireNanos(int arg, long nanosTimeout) throws InterruptedException {
+        if (nanosTimeout <= 0L) {
+            return false;
+        }
+        final long deadline = System.nanoTime() + nanosTimeout;
+        final Node node = addWaiter(Node.EXCLUSIVE);
+        boolean failed = true;
+        try {
+            for (; ; ) {
+                final Node p = node.predecessor();
+                if (p == head && tryAcquire(arg)) {
+                    setHead(node);
+                    p.next = null;
+                    failed = false;
+                    return true;
+                }
+                nanosTimeout = deadline - System.nanoTime();
+                if (nanosTimeout <= 0L) {
+                    return false;
+                }
+                if (shouldParkAfterFailedAcquire(p, node) && nanosTimeout > spinForTimeoutThreshold) {
+                    LockSupport.parkNanos(this, nanosTimeout);
+                }
+                if (Thread.interrupted()) {
+                    throw new InterruptedException();
+                }
+            }
+        } finally {
+            if (failed) {
+                cancelAcquire(node);
+            }
+        }
+    }
+
+    protected boolean tryAcquire(int arg) {
+        throw new UnsupportedOperationException();
     }
 }
